@@ -17,13 +17,16 @@ log = logging.getLogger("comfyui-prompt-control")
 prompt_parser = lark.Lark(
     r"""
 !start: (prompt | /[][():]/+)*
-prompt: (emphasized | scheduled | alternate | sequence | loraspec | PLAIN | /</ | />/ | WHITESPACE)+
+prompt: (emphasized | scheduled | alternate | sequence | interpolate | loraspec | PLAIN | /</ | />/ | WHITESPACE)+
 !emphasized: "(" prompt? ")"
         | "(" prompt ":" prompt ")"
         | "[" prompt "]"
 scheduled: "[" [prompt ":"] [prompt] ":" WHITESPACE? NUMBER "]"
         | "[" [prompt ":"] [prompt] ":" WHITESPACE? TAG "]"
 sequence:  "[SEQ" ":" [prompt] ":" NUMBER (":" [prompt] ":" NUMBER)+ "]"
+interpolate: "[INT" ":" interp_prompts ":" interp_steps "]"
+interp_prompts: prompt (":" prompt)+
+interp_steps: NUMBER ("," NUMBER)+ [":" NUMBER]
 alternate: "[" [prompt] ("|" [prompt])+ [":" NUMBER] "]"
 loraspec: "<lora:" PLAIN (":" WHITESPACE? NUMBER)~1..2 ">"
 WHITESPACE: /\s+/
@@ -36,7 +39,7 @@ TAG: /[A-Z_]+/
 
 
 def flatten(x):
-    if type(x) in [str, tuple]:
+    if type(x) in [str, tuple] or isinstance(x, dict) and "type" in x:
         yield x
     else:
         for g in x:
@@ -50,15 +53,29 @@ def clamp(a, b, c):
 
 def get_steps(tree):
     res = [100]
+    interpolation_steps = []
+
+    def tostep(s):
+        w = float(s) * 100
+        w = int(clamp(0, w, 100))
+        res.append(w)
+        return w
 
     class CollectSteps(lark.Visitor):
         def scheduled(self, tree):
             i = tree.children[-1]
             if i.type == "TAG":
                 return
-            w = float(tree.children[-1]) * 100
-            tree.children[-1] = clamp(0, w, 100)
-            res.append(w)
+            tree.children[-1] = tostep(tree.children[-1])
+
+        def interp_steps(self, tree):
+            tree.children[-1] = step = tostep(tree.children[-1] or 0.1)
+            for i, (start, end) in enumerate(zip(tree.children[:-1], tree.children[1:-1])):
+                tree.children[i] = start = tostep(tree.children[i])
+                tree.children[i + 1] = end = tostep(tree.children[i + 1])
+                print("a %s %s %s", start, end, step)
+                interpolation_steps.append((start, end, step))
+                res.extend([start, end])
 
         def sequence(self, tree):
             steps = tree.children[1::2]
@@ -74,7 +91,7 @@ def get_steps(tree):
             res.extend([x for x in range(step_size, 100, step_size)])
 
     CollectSteps().visit(tree)
-    return sorted(set(res))
+    return sorted(set(interpolation_steps)), sorted(set(res))
 
 
 def at_step(step, filters, tree):
@@ -98,6 +115,25 @@ def at_step(step, filters, tree):
                     previous_step = s
             return ()
 
+        def interpolate(self, args):
+            prompts, starts = args
+            prev_val = None
+            for i, x in enumerate(starts[:-1]):
+                if x > step and prev_val:
+                    return prev_val
+                elif step == x:
+                    return prompts[i]
+                else:
+                    prev_val = prompts[i]
+
+            return prompts[-1]
+
+        def interp_steps(self, args):
+            return list(args)
+
+        def interp_prompts(self, args):
+            return ["".join(a) for a in args]
+
         def alternate(self, args):
             step_size = args[-1]
             idx = ceil(step / step_size)
@@ -110,7 +146,7 @@ def at_step(step, filters, tree):
             for a in args:
                 if type(a) == str:
                     prompt.append(a)
-                elif a:
+                elif isinstance(a, tuple):
                     # sum identical specs together
                     n = a[0]
                     # if clip weight is not provided, use unet weight
@@ -122,6 +158,8 @@ def at_step(step, filters, tree):
                     }
                     if loraspecs[n]["weight"] == 0 and loraspecs[n]["weight_clip"] == 0:
                         del loraspecs[n]
+                else:
+                    print("Got: ", a)
             p = "".join(prompt)
             return {"prompt": p, "loras": loraspecs}
 
@@ -157,7 +195,8 @@ class PromptSchedule(object):
         filters = [x.strip() for x in self.filters.upper().split(",")]
         try:
             tree = prompt_parser.parse(self.prompt)
-            steps = get_steps(tree)
+            interpolation_steps, steps = get_steps(tree)
+            log.info("Interpolation steps: %s", interpolation_steps)
             parsed = [[round(t / 100, 2), at_step(t, filters, tree)] for t in steps]
         except lark.exceptions.LarkError as e:
             log.error("Prompt editing parse error: %s", e)

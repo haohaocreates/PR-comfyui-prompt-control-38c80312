@@ -1,6 +1,6 @@
 from . import utils as utils
 from .parser import parse_prompt_schedules
-from .node_other import steps
+from .utils import steps
 
 from nodes import NODE_CLASS_MAPPINGS as COMFY_NODES
 
