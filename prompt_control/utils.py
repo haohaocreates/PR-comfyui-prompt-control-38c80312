@@ -32,7 +32,6 @@ def finish_sampling(model):
 
 def set_state(model, key, value):
     s = get_state(model, None)
-    print(f"Setting key {key} on state {id(s)}")
     s[key] = value
 
 
@@ -43,7 +42,6 @@ def get_state(model, key):
         if key is None:
             return s
         else:
-            print(f"Getting key {key} on state {id(s)}")
             return s.get(key)
     # Init missing state and retry
     x = dict(applied_loras={})
